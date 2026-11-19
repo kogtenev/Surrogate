@@ -40,7 +40,26 @@
 Фазы в данных нет, поэтому подгоняется 20 lg|S_ij| к S_dB методом Левенберга-Марквардта
 (нормальные уравнения собираются блоками по парам моделей) с несколькими случайными стартами и
 продолжением по порядку мультиполей. Значения ниже THRESHOLD_DB не подгоняются: штраф только если
-модель предсказывает для них больше порога. Диагональные S_ii не используются (их может не быть).
+модель предсказывает для них больше порога.
+
+Модель через полную матрицу импедансов (Z_MODEL = True), обучается второй:
+    z_ij (i != j) -- та же мультипольная формула, что выше (нормированный взаимный импеданс);
+    z_kk = zeta_m -- собственный нормированный импеданс уникальной модели m (комплексный параметр);
+    S = (z - E)(z + E)^{-1} = E - 2 (z + E)^{-1}  -- для каждой конфигурации решетки целиком.
+  Учитывает переотражения и сильные связи (третья антенна между двумя, близкие соседи); модель
+  прямой связи -- первый член ряда Неймана этой формулы, S_ij ~ 2 z_ij / ((1 + zeta_i)(1 + zeta_j)).
+  Опорные импедансы портов (Z0 сосредоточенных, gamma волноводных) отдельно не задаются: нормировка
+  z = G^{-1/2} Z G^{-1/2}, G = diag(Z_ref), входит в коэффициенты и zeta каждой модели.
+  Подгоняются |S_ij| и |S_ii| в дБ (тот же порог). Старты: коэффициенты по полю из VTK (если есть) и
+  модель прямой связи; |Gamma| = |(zeta - 1)/(zeta + 1)| -- по медиане |S_ii| модели, фазы -- перебором;
+  берется старт с наименьшей функцией потерь. Если модель через Z на обучающих S_ij хуже прямой
+  связи, итоговые S_ij берутся из прямой (с предупреждением). Без S_ii zeta определяются только
+  через переотражения (хуже обусловлено).
+  Диагональ добавляется в файл S-параметров вспомогательным скриптом merge_diag.py (строки с
+  ant_j = ant_i).
+
+Печатается время: поиск полюсов, обучение прямой связи и модели через Z, всего; предсказание всех
+S одной конфигурации решетки (в пакете тестовых конфигураций и по одной).
 
 Обучение: eval_id % 3 == 1 (eval_id = 1, 4, 7, ...), тест -- остальные. Порядок мультиполей
 (<= MAX_ORDER) и регуляризация выбираются кросс-валидацией только по обучающей выборке; тест
@@ -52,13 +71,18 @@
              (столбцы x{i}_mm, y{i}_mm, th{i}_deg ищутся по именам; если имен нет -- тройками
              после первых трех столбцов);
   S:         eval_id, freq_idx, freq_GHz, ant_i, ant_j, S_ij_dB  (ant_i -- номер i из геометрии;
-             нумерация с 1 тоже распознается);
+             нумерация с 1 тоже распознается; строки ant_i = ant_j -- модули S_ii, необязательны);
   YAML:      Antennas: список {ID, Unique model}; Unique models: {номер: {Number of Poles,
              Solution File, Real Field Name, Imag Field Name, Attributes, Origin, Rotation}}
              (необязательно: Attribute Field Name -- имя массива атрибутов в VTK). Пути к VTK --
              относительно папки YAML-файла.
 
+Результаты (OUT_DIR): predictions_f*.csv (S_pred_dB -- итоговая модель, S_pred_direct_dB -- прямая
+связь; строки S_ii -- только модель через Z), model_f*.npz (model_kind = "z" или "direct", zeta),
+poles_f*.csv, графики и диагностика промахов.
+
 Запуск:
+    python3 merge_diag.py pool1_s.csv pool1_sdiag.csv pool1_sfull.csv   # добавить S_ii (по желанию)
     python3 train_surrogate.py                                   # файлы из настроек ниже
     python3 train_surrogate.py g1.csv s1.csv g2.csv s2.csv g3.csv s3.csv
     python3 train_surrogate.py antennas.yaml g1.csv s1.csv ...  # с полюсами из YAML
@@ -105,6 +129,9 @@ CV_FOLDS = 3                 # блоков кросс-валидации (по 
 N_RESTARTS = 6               # случайных стартов на нулевом порядке
 CV_RESTARTS = 2              # то же при кросс-валидации
 MAX_ITER = 100               # итераций Левенберга-Марквардта на одну подгонку
+Z_MODEL = True               # модель через полную матрицу импедансов (переотражения, сильные связи);
+                             # обучается после модели прямой связи и стартует от нее
+REG_ZETA = 1e-3              # слабая регуляризация собственных импедансов к 1 (согласованный порт)
 MEMORY_WARN_GB = 4.0         # предупреждать, если матрицы связи обучающей выборки больше
 SEED = 0
 OUT_DIR = "surrogate_out"
@@ -302,8 +329,9 @@ def parse_geometry(geom, gfile):
 
 
 def load_pools(files, freq_idx):
-    """Наблюдения S_ij (i != j) со всеми пулами: DataFrame + число антенн."""
-    obs_all, n_ant = [], None
+    """Наблюдения S_ij (i != j) со всеми пулами: DataFrame + число антенн. Диагональные S_ii (если
+    есть) -- в obs.attrs["diag"]."""
+    obs_all, diag_all, n_ant = [], [], None
     geometry = {}
     for pid, (gfile, sfile) in enumerate(files):
         eid, labels, X, Y, TH = parse_geometry(pd.read_csv(gfile), gfile)
@@ -313,10 +341,11 @@ def load_pools(files, freq_idx):
         s = s[s["freq_idx"] == freq_idx]
         if s.empty:
             raise SystemExit(f"{sfile}: нет строк с freq_idx = {freq_idx}")
-        n_diag = int((s["ant_i"] == s["ant_j"]).sum())
+        sd = s[s["ant_i"] == s["ant_j"]]
+        n_diag = len(sd)
         s = s[s["ant_i"] != s["ant_j"]]
         # метки антенн в S -> номера столбцов геометрии
-        lab = set(s["ant_i"]).union(s["ant_j"])
+        lab = set(s["ant_i"]).union(s["ant_j"]).union(sd["ant_i"])
         pos = {l: q for q, l in enumerate(labels)}
         if lab <= set(labels):
             amap = pos
@@ -325,10 +354,16 @@ def load_pools(files, freq_idx):
             print(f"  {sfile}: номера антенн с 1, сдвинуты на -1")
         else:
             raise SystemExit(f"{sfile}: номера антенн {sorted(lab)} не соответствуют геометрии {labels}")
-        missing = set(s["eval_id"]) - set(row_of)
+        missing = set(s["eval_id"]).union(sd["eval_id"]) - set(row_of)
         if missing:
             print(f"  {sfile}: нет геометрии для {len(missing)} eval_id -- строки пропущены")
             s = s[s["eval_id"].isin(row_of.keys())]
+            sd = sd[sd["eval_id"].isin(row_of.keys())]
+        if n_diag:
+            diag_all.append(pd.DataFrame({
+                "pool": pid, "eval_id": sd["eval_id"].to_numpy(), "ant_i": sd["ant_i"].to_numpy(),
+                "i": sd["ant_i"].map(amap).to_numpy(), "freq_GHz": sd["freq_GHz"].to_numpy(float),
+                "S_ii_dB": sd["S_ij_dB"].to_numpy(float)}))
         r = s["eval_id"].map(row_of).to_numpy()
         i = s["ant_i"].map(amap).to_numpy()
         j = s["ant_j"].map(amap).to_numpy()
@@ -338,7 +373,7 @@ def load_pools(files, freq_idx):
             "S_ij_dB": s["S_ij_dB"].to_numpy(float),
             "xi": X[r, i], "yi": Y[r, i], "thi": TH[r, i], "xj": X[r, j], "yj": Y[r, j], "thj": TH[r, j]})
         print(f"  пул {pid + 1}: {gfile}, {sfile}: конфигураций {len(eid)}, антенн {len(labels)}, "
-              f"строк S_ij (i != j) {len(df)}" + (f", пропущено S_ii {n_diag}" if n_diag else ""))
+              f"строк S_ij (i != j) {len(df)}, S_ii {n_diag}")
         if n_ant is not None and n_ant != len(labels) and SHARED_ACROSS_POOLS:
             raise SystemExit("в пулах разное число антенн -- поставьте SHARED_ACROSS_POOLS = False")
         n_ant = len(labels)
@@ -353,6 +388,11 @@ def load_pools(files, freq_idx):
     obs["dist_mm"] = np.hypot(obs["xj"] - obs["xi"], obs["yj"] - obs["yi"])
     obs.attrs["geometry"] = geometry
     obs.attrs["labels"] = labels
+    diag = pd.concat(diag_all, ignore_index=True) if diag_all else None
+    if diag is not None:
+        diag["train"] = (diag["eval_id"] % TRAIN_MOD) == 1
+        diag["group"] = diag["pool"].astype(str) + ":" + diag["eval_id"].astype(str)
+    obs.attrs["diag"] = diag
     return obs, n_ant, float(freqs[0])
 
 
@@ -1262,6 +1302,296 @@ def predict_all(model, pairs, inv, model_of, models, k, sgn, nb):
             s_pair[idx] = (g.block(kk) @ a1) @ a0
     return DB * np.log(np.abs(s_pair[inv]) + 1e-300)
 # ---------------------------------------------------------------------
+#  Модель через полную матрицу импедансов
+# ---------------------------------------------------------------------
+# Для конфигурации из N антенн: z_ij (i != j) -- та же мультипольная формула (нормированный взаимный
+# импеданс), z_kk = zeta_m -- собственный импеданс модели антенны (комплексный, общий для копий),
+# S = (z - E)(z + E)^{-1} = E - 2 W,  W = (z + E)^{-1}.  dS = 2 W dz W.
+# Нормировка на опорные импедансы портов входит в коэффициенты и zeta; выход -- S в нормировке FEM.
+
+class ZProblem:
+    """Конфигурации решетки целиком: все пары антенн (lo < hi) и наблюдения S (вне диагонали и на ней)."""
+
+    def __init__(self, cfg, geometry, n_ant, model_of, models, k, sgn, nb, obs=None, diag=None):
+        self.C, self.N = len(cfg), n_ant
+        self.lo, self.hi = np.triu_indices(n_ant, 1)
+        self.P = len(self.lo)
+        self.model_of = model_of
+        X = np.empty((self.C, n_ant))
+        Y = np.empty((self.C, n_ant))
+        TH = np.empty((self.C, n_ant))
+        pools = cfg["pool"].to_numpy()
+        for pid, (row_of, GX, GY, GT) in geometry.items():
+            m = pools == pid
+            if m.any():
+                r = cfg.loc[m, "eval_id"].map(row_of).to_numpy()
+                X[m], Y[m], TH[m] = GX[r], GY[r], GT[r]
+        lo, hi = self.lo, self.hi
+        ml, mh = model_of[lo], model_of[hi]
+        self.groups = []
+        for a, b in sorted(set(zip(ml.tolist(), mh.tolist()))):
+            idx = np.flatnonzero((ml == a) & (mh == b))
+            pdf = pd.DataFrame({"x_lo": X[:, lo[idx]].ravel(), "y_lo": Y[:, lo[idx]].ravel(),
+                                "th_lo": TH[:, lo[idx]].ravel(), "x_hi": X[:, hi[idx]].ravel(),
+                                "y_hi": Y[:, hi[idx]].ravel(), "th_hi": TH[:, hi[idx]].ravel()})
+            g = Group(a, b, models[a].n, models[b].n, nb, group_matrices(pdf, models[a], models[b], k, sgn, nb))
+            self.groups.append((g, idx))
+        self.Yobs = np.full((self.C, n_ant, n_ant), np.nan)
+        cid = {key: q for q, key in enumerate(zip(cfg["pool"].tolist(), cfg["eval_id"].tolist()))}
+        for df, col, jcol in ((obs, "S_ij_dB", "j"), (diag, "S_ii_dB", "i")):
+            if df is None or len(df) == 0:
+                continue
+            c = np.array([cid.get(key, -1) for key in zip(df["pool"].tolist(), df["eval_id"].tolist())])
+            ok = c >= 0
+            self.Yobs[c[ok], df["i"].to_numpy()[ok], df[jcol].to_numpy()[ok]] = df[col].to_numpy(float)[ok]
+        self.mask = ~np.isnan(self.Yobs)
+        self.n_obs = int(self.mask.sum())
+        d = np.arange(n_ant)
+        self.diag_mask = np.zeros_like(self.mask)
+        self.diag_mask[:, d, d] = True
+
+
+def z_assemble(model, zeta, zp, need_grads=False):
+    """-> (Z (C,N,N), градиенты пар по коэффициентам моделей). zeta=None -- без диагонали."""
+    C, N = zp.C, zp.N
+    zpair = np.zeros((C, zp.P), complex)
+    grads = []
+    for g, idx in zp.groups:
+        B = g.block(model.k)
+        a0, a1 = model.flat(g.m0), model.flat(g.m1)
+        G0 = B @ a1
+        zpair[:, idx] = (G0 @ a0).reshape(C, len(idx))
+        if need_grads:
+            grads.append((g.m0, g.m1, idx, G0.reshape(C, len(idx), -1), (a0 @ B).reshape(C, len(idx), -1)))
+    Z = np.zeros((C, N, N), complex)
+    Z[:, zp.lo, zp.hi] = zpair
+    Z[:, zp.hi, zp.lo] = zpair
+    if zeta is not None:
+        d = np.arange(N)
+        Z[:, d, d] = zeta[zp.model_of]
+    return Z, grads
+
+
+def z_predict_S(model, zeta, zp):
+    """S (C,N,N): zeta=None -- модель прямой связи (S_ij = значение пары, диагональ NaN)."""
+    Z, _ = z_assemble(model, zeta, zp)
+    if zeta is None:
+        d = np.arange(zp.N)
+        Z[:, d, d] = np.nan
+        return Z
+    E = np.eye(zp.N)
+    return E - 2.0 * np.linalg.inv(Z + E)
+
+
+def z_pack(model, zeta):
+    return np.concatenate([model.pack(), np.column_stack([zeta.real, zeta.imag]).ravel()])
+
+
+def z_unpack(model, x):
+    P = model.off[-1]
+    model.unpack(x[:P])
+    z = x[P:].reshape(-1, 2)
+    return z[:, 0] + 1j * z[:, 1]
+
+
+def z_evaluate(model, x, zp, thr, need_jac=True, chunk=40):
+    """Невязки (дБ) по наблюдаемым элементам S и плотный якобиан по [коэффициенты, zeta]."""
+    zeta = z_unpack(model, x)
+    Z, grads = z_assemble(model, zeta, zp, need_jac)
+    N = zp.N
+    E = np.eye(N)
+    W = np.linalg.inv(Z + E)
+    S = E - 2.0 * W
+    msk = zp.mask
+    So = S[msk]
+    y = zp.Yobs[msk]
+    mdb = DB * np.log(np.abs(So) + 1e-300)
+    res = thresholded_residual(mdb, y, thr)
+    if not need_jac:
+        return res, None
+    active = (y >= thr) | (mdb > thr)
+    w = DB / (np.abs(So) ** 2 + 1e-300) * active
+    sc = np.conj(So)
+    U = len(model.C)
+    Pc = model.off[-1]
+    J = np.zeros((zp.n_obs, Pc + 2 * U))
+    lo, hi = zp.lo, zp.hi
+    members = [np.flatnonzero(zp.model_of == m) for m in range(U)]
+    row = 0
+    for a in range(0, zp.C, chunk):
+        b = min(zp.C, a + chunk)
+        Wc = W[a:b]
+        mc = msk[a:b]
+        nr = int(mc.sum())
+        if nr == 0:
+            continue
+        rows = slice(row, row + nr)
+        scw = (sc * w)[rows]
+        Wlo, Whi = Wc[:, :, lo], Wc[:, :, hi]                     # (c, N, P)
+        A = 2.0 * (Wlo[:, :, None, :] * Whi[:, None, :, :] + Whi[:, :, None, :] * Wlo[:, None, :, :])
+        A = A.reshape(b - a, N * N, -1)                            # dS_ij / dz_pair
+        mflat = mc.reshape(b - a, N * N)
+        for m in range(U):
+            q = model.off[m + 1] - model.off[m]
+            if q == 0:
+                continue
+            Jm = None
+            for m0, m1, idx, G0, G1 in grads:
+                for mm, G in ((m0, G0), (m1, G1)):
+                    if mm != m:
+                        continue
+                    t = np.matmul(A[:, :, idx], G[a:b].astype(complex))       # (c, N*N, q/2)
+                    Jm = t if Jm is None else Jm + t
+            if Jm is None:
+                continue
+            Jo = Jm[mflat]                                         # (nr, q/2) -- dS/da
+            h = scw[:, None] * Jo
+            J[rows, model.off[m]:model.off[m + 1]] = np.hstack([h.real, -h.imag])
+            if len(members[m]):                                    # dS/dzeta_m = 2 sum_k W_ik W_kj
+                Dz = 2.0 * np.einsum("cik,cjk->cij", Wc[:, :, members[m]], Wc[:, :, members[m]])
+                hz = scw * Dz[mc]
+                J[rows, Pc + 2 * m] = hz.real
+                J[rows, Pc + 2 * m + 1] = -hz.imag
+        row += nr
+    return res, J
+
+
+def z_fit(model, zeta, zp, thr, reg, max_iter=MAX_ITER, tol=1e-7, log=None):
+    """Левенберг-Марквардт по коэффициентам и собственным импедансам."""
+    from scipy.linalg import cho_factor, cho_solve, LinAlgError
+    per = np.sqrt(reg) * (1.0 + BASIS_ORDER[:model.k])
+    rw = np.concatenate([np.tile(np.tile(per, n), 2) for n in model.n_poles] + [np.full(2 * len(zeta), np.sqrt(REG_ZETA))])
+    prior = np.zeros(len(rw))
+    prior[model.off[-1]::2] = 1.0                                  # zeta -> 1 (согласованный порт), слабо
+    rw2 = rw ** 2
+    x = z_pack(model, zeta)
+
+    def cost_of(x, res):
+        return 0.5 * (res @ res + rw2 @ ((x - prior) ** 2))
+
+    res, J = z_evaluate(model, x, zp, thr)
+    cost = cost_of(x, res)
+    mu = 1e-3
+    for it in range(max_iter):
+        H = J.T @ J
+        H[np.diag_indices(len(x))] += rw2
+        gvec = J.T @ res + rw2 * (x - prior)
+        dH = np.diag(H).copy()
+        improved = False
+        while mu < 1e10:
+            try:
+                d = -cho_solve(cho_factor(H + mu * np.diag(dH + 1e-12 * dH.max())), gvec)
+            except LinAlgError:
+                mu *= 10
+                continue
+            xn = x + d
+            rn, _ = z_evaluate(model, xn, zp, thr, need_jac=False)
+            cn = cost_of(xn, rn)
+            if cn < cost:
+                rel = (cost - cn) / max(cost, 1e-300)
+                x, cost = xn, cn
+                res, J = z_evaluate(model, x, zp, thr)
+                mu = max(mu / 3, 1e-9)
+                improved = True
+                break
+            mu *= 4
+        if not improved or rel < tol:
+            break
+    zeta = z_unpack(model, x)
+    return cost, zeta
+
+
+def z_cost(model, zeta, zp, thr):
+    res, _ = z_evaluate(model, z_pack(model, zeta), zp, thr, need_jac=False)
+    return 0.5 * res @ res
+
+
+def z_init(direct, zp, diag_train, model_of, thr, log=print):
+    """Начальное приближение модели через Z от модели прямой связи.
+    S_ij ~ 2 z_ij / ((1 + zeta_i)(1 + zeta_j))  ->  a_m <- a_m (1 + zeta_m) / sqrt(2) e^{i phi_m};
+    |Gamma_m| -- по медиане |S_ii| антенн модели, фаза Gamma_m (psi_m) и phi_m -- перебором."""
+    U = len(direct.C)
+    gmag = np.zeros(U)
+    if diag_train is not None and len(diag_train):
+        for m in range(U):
+            v = diag_train.loc[model_of[diag_train["i"].to_numpy()] == m, "S_ii_dB"]
+            if len(v):
+                gmag[m] = min(10 ** (np.median(v) / 20.0), 0.95)
+    psi = np.zeros(U)
+    phi = np.zeros(U)
+
+    def build(psi, phi):
+        G = gmag * np.exp(1j * psi)
+        zeta = (1 + G) / (1 - G)
+        mod = direct.copy_to(direct.order)
+        mod.C = [c * (1 + zeta[m]) / np.sqrt(2) * np.exp(1j * phi[m]) for m, c in enumerate(direct.C)]
+        return mod, zeta
+
+    best = z_cost(*build(psi, phi), zp, thr)
+    psis = np.linspace(0, 2 * np.pi, 8, endpoint=False)
+    phis = np.linspace(0, np.pi, 4, endpoint=False)                # phi и phi + pi эквивалентны (знак)
+    for sweep in range(2):
+        for m in range(U):
+            if not np.any(model_of == m):
+                continue
+            for ps in (psis if gmag[m] > 0.01 else [0.0]):
+                for ph in phis:
+                    p2, f2 = psi.copy(), phi.copy()
+                    p2[m], f2[m] = ps, ph
+                    c = z_cost(*build(p2, f2), zp, thr)
+                    if c < best:
+                        best, psi, phi = c, p2, f2
+    if log:
+        log(f"    старт модели через Z: |Gamma| моделей по медиане |S_ii|: "
+            + ", ".join(f"{20 * np.log10(g):.1f} дБ" if g > 0 else "нет данных" for g in gmag)
+            + f"; функция потерь после перебора фаз {best:.4g}")
+    return build(psi, phi)
+
+
+def z_scale_first_order(model, zp, model_of, thr):
+    """Масштаб коэффициентов каждой модели по взаимным |S| в первом порядке (S_ij ~ значение пары):
+    линейный МНК в дБ, как scale_per_model, но на задаче всей решетки."""
+    Sd = z_predict_S(model, None, zp)
+    msk = zp.mask & ~zp.diag_mask
+    pred = DB * np.log(np.abs(Sd[msk]) + 1e-300)
+    yy = zp.Yobs[msk]
+    _, ii, jj = np.nonzero(msk)
+    U = len(model.C)
+    X = np.zeros((len(yy), U))
+    np.add.at(X, (np.arange(len(yy)), model_of[ii]), 1.0)
+    np.add.at(X, (np.arange(len(yy)), model_of[jj]), 1.0)
+    big = yy >= thr
+    o = np.linalg.lstsq(X[big], (yy - pred)[big], rcond=None)[0]
+    model.C = [c * 10 ** (o[m] / 20.0) for m, c in enumerate(model.C)]
+    return model
+
+
+def config_table(obs, diag):
+    """Конфигурации (пул, eval_id) с признаком обучения."""
+    parts = [obs[["pool", "eval_id", "train"]]]
+    if diag is not None and len(diag):
+        parts.append(diag[["pool", "eval_id", "train"]])
+    return pd.concat(parts).drop_duplicates(["pool", "eval_id"]).sort_values(["pool", "eval_id"]).reset_index(drop=True)
+
+
+def lattice_predict(model, zeta, cfg, geometry, n_ant, model_of, models, k, sgn, nb, chunk=50):
+    """Полные матрицы S (C, N, N) для конфигураций (кусками). zeta=None -- прямая связь."""
+    out = np.empty((len(cfg), n_ant, n_ant), complex)
+    for a in range(0, len(cfg), chunk):
+        part = cfg.iloc[a:a + chunk]
+        zp = ZProblem(part, geometry, n_ant, model_of, models, k, sgn, nb)
+        out[a:a + len(part)] = z_predict_S(model, zeta, zp)
+    return out
+
+
+def lattice_values(S, cfg, df, jcol):
+    """Значения |S| в дБ для строк df (пул, eval_id, i, j/i)."""
+    cid = {key: q for q, key in enumerate(zip(cfg["pool"].tolist(), cfg["eval_id"].tolist()))}
+    c = np.array([cid[key] for key in zip(df["pool"].tolist(), df["eval_id"].tolist())])
+    return DB * np.log(np.abs(S[c, df["i"].to_numpy(), df[jcol].to_numpy()]) + 1e-300)
+
+
+# ---------------------------------------------------------------------
 #  Оценка
 # ---------------------------------------------------------------------
 def metrics(y, p, thr):
@@ -1553,7 +1883,24 @@ def diagnostics(obs, pred, geometry, k, sgn, prefix):
 
 
 
-def run(obs, models, model_of, freq, tag, rng):
+def level_table(y, preds, thr, title):
+    """Ошибки по уровню |S| в расчете для нескольких моделей: {имя: предсказание}."""
+    edges = [(thr, -20.0, f"{thr:g}..-20"), (-20.0, -10.0, "-20..-10"), (-10.0, np.inf, "> -10")]
+    print(f"  {title}:")
+    for a, b, nm in edges:
+        msk = (y >= a) & (y < b)
+        if not msk.any():
+            continue
+        parts = []
+        for name, p in preds.items():
+            e = p[msk] - y[msk]
+            parts.append(f"{name}: MAE {np.mean(np.abs(e)):5.2f} дБ, среднее {np.mean(e):+5.2f}, "
+                         f"<=3 дБ {100 * np.mean(np.abs(e) <= 3):5.1f}%")
+        print(f"    {nm + ' дБ':<12} (строк {msk.sum():6d})  " + ";   ".join(parts))
+
+
+def run(obs, diag, models, model_of, freq, tag, rng, geometry, n_ant):
+    """Обучение и оценка. -> dict с предсказаниями, моделями и временами."""
     k = 2 * np.pi * freq / C_MM_PER_NS
     lam = 2 * np.pi / k
     y = obs["S_ij_dB"].to_numpy(float)
@@ -1564,6 +1911,8 @@ def run(obs, models, model_of, freq, tag, rng):
     n_poles = [m.n for m in models]
     max_order = MAX_ORDER if MAX_ORDER is not None else (1 if max(n_poles) > 1 else 2)
     nb = n_basis(max_order)
+    timing = {}
+    t_train0 = time.time()
     used_models = sorted(set(model_of[pairs["lo"]].tolist()) | set(model_of[pairs["hi"]].tolist()))
     print(f"\n=== {tag}: f = {freq:g} ГГц, lambda = {lam:.2f} мм; антенн {len(model_of)}, моделей {len(used_models)}, "
           f"полюсов в моделях: {[models[m].n for m in used_models]}, порядок мультиполей до {max_order}")
@@ -1572,6 +1921,8 @@ def run(obs, models, model_of, freq, tag, rng):
     print(f"  наблюдений: обучение {tr.sum()}, тест {(~tr).sum()}; уникальных пар {len(pairs)}; конфигураций: "
           f"обучение {len(np.unique(groups[tr]))}, тест {len(np.unique(groups[~tr]))}; "
           f"матрицы связи обучающей выборки {gb:.2f} ГБ")
+    if diag is not None:
+        print(f"  диагональных S_ii: {len(diag)} (обучение {int(diag['train'].sum())})")
     if gb > MEMORY_WARN_GB:
         print(f"  ВНИМАНИЕ: много памяти; уменьшите MAX_ORDER или число полюсов")
     print(f"  расстояния {r.min():.1f}..{r.max():.1f} мм ({r.min() / lam:.2f}..{r.max() / lam:.2f} lambda); "
@@ -1616,9 +1967,48 @@ def run(obs, models, model_of, freq, tag, rng):
             print(f"  обучение с регуляризацией {reg:g}:")
             hist = train(prob, n_poles, THRESHOLD_DB, rng, reg, max_order, init=init)
     prob = None
+    direct = hist[order][2]
+    timing["direct"] = time.time() - t_train0
 
-    # 3. Ошибки
-    print("  Ошибки (обучение / тест):")
+    # 3. Модель через полную матрицу Z (старт от модели прямой связи)
+    cfg = config_table(obs, diag)
+    cfg_tr = cfg[cfg["train"].to_numpy()].reset_index(drop=True)
+    cfg_te = cfg[~cfg["train"].to_numpy()].reset_index(drop=True)
+    zmodel, zeta = None, None
+    if Z_MODEL:
+        t_s = time.time()
+        print(f"  модель через полную матрицу Z (регуляризация {reg:g}, порядок {order}):")
+        if diag is None:
+            print("    диагональных S_ii нет: собственные импедансы определяются только через переотражения")
+        dtr = diag[diag["train"].to_numpy()] if diag is not None else None
+        zp = ZProblem(cfg_tr, geometry, n_ant, model_of, models, k, sgn, n_basis(order), obs[tr], dtr)
+        # старты: коэффициенты по полю из VTK (одиночная антенна, ничего не "впитали") и модель прямой
+        # связи; из каждого -- перебор фаз и Левенберг-Марквардт, берется лучший
+        starts = []
+        if order in init:
+            starts.append(("поле из VTK", z_scale_first_order(init[order].copy_to(order), zp, model_of, THRESHOLD_DB)))
+        starts.append(("прямая связь", direct))
+        best = None
+        for name, m0 in starts:
+            print(f"    старт: {name}")
+            mz, z0 = z_init(m0, zp, dtr, model_of, THRESHOLD_DB)
+            cost, zf = z_fit(mz, z0, zp, THRESHOLD_DB, reg)
+            print(f"      функция потерь после подгонки {cost:.4g}")
+            if best is None or cost < best[0]:
+                best = (cost, mz, zf, name)
+        cost, zmodel, zeta, zname = best
+        if len(starts) > 1:
+            print(f"    выбран старт: {zname}")
+        zp = None
+        timing["z"] = time.time() - t_s
+        gam = (zeta - 1) / (zeta + 1)
+        print(f"    функция потерь {cost:.4g} ({timing['z']:.0f} с); собственные импедансы zeta: "
+              + ", ".join(f"{models[m].name}: {zeta[m].real:.3f}{zeta[m].imag:+.3f}i (|Gamma| {20 * np.log10(abs(gam[m]) + 1e-300):.1f} дБ)"
+                          for m in used_models))
+    timing["train"] = time.time() - t_train0
+
+    # 4. Предсказания и ошибки
+    print("  Ошибки (обучение / тест), взаимные S_ij:")
     for name, pred in [("1/r, подгонка уровня", distance_baseline(r, y, THRESHOLD_DB, tr, False)),
                        ("A - B*10lg r", distance_baseline(r, y, THRESHOLD_DB, tr, True))]:
         print(f"    {name:<26} обуч.: {fmt(metrics(y[tr], pred[tr], THRESHOLD_DB))}")
@@ -1627,22 +2017,63 @@ def run(obs, models, model_of, freq, tag, rng):
     for o, _, model in hist:
         pred = predict_all(model, pairs, inv, model_of, models, k, sgn, nb)
         preds[o] = pred
-        name = f"мультиполи, порядок {o}" + (" (*)" if o == order else "")
+        name = f"прямая связь, порядок {o}" + (" (*)" if o == order else "")
         print(f"    {name:<26} обуч.: {fmt(metrics(y[tr], pred[tr], THRESHOLD_DB))}")
         print(f"    {'':<26} тест : {fmt(metrics(y[~tr], pred[~tr], THRESHOLD_DB))}")
     if DO_CV:
         print("    (*) -- выбрано кросс-валидацией; тестовая выборка в выборе не участвует")
-    final = preds[order]
+    pred_direct = preds[order]
+    pred_final, pred_diag, use_z = pred_direct, None, False
+    nbo = n_basis(order)
+    if Z_MODEL:
+        S_all = lattice_predict(zmodel, zeta, cfg, geometry, n_ant, model_of, models, k, sgn, nbo)
+        pred_z = lattice_values(S_all, cfg, obs, "j")
+        print(f"    {'полная матрица Z':<26} обуч.: {fmt(metrics(y[tr], pred_z[tr], THRESHOLD_DB))}")
+        print(f"    {'':<26} тест : {fmt(metrics(y[~tr], pred_z[~tr], THRESHOLD_DB))}")
+        rms = lambda p: np.sqrt(np.mean(thresholded_residual(p[tr], y[tr], THRESHOLD_DB) ** 2))
+        if rms(pred_z) <= rms(pred_direct):
+            pred_final, use_z = pred_z, True
+        else:
+            print(f"    ВНИМАНИЕ: модель через Z на обучающих S_ij хуже прямой связи (RMS {rms(pred_z):.2f} против "
+                  f"{rms(pred_direct):.2f} дБ) -- итоговые S_ij берутся из прямой связи; вероятно, подгонка Z "
+                  f"застряла в локальном минимуме (помогает старт по полю из VTK)")
+        if diag is not None:
+            pred_diag = lattice_values(S_all, cfg, diag, "i")
+            yd = diag["S_ii_dB"].to_numpy(float)
+            dtr = diag["train"].to_numpy()
+            print("  Ошибки, собственные S_ii (только модель через Z):")
+            print(f"    {'полная матрица Z':<26} обуч.: {fmt(metrics(yd[dtr], pred_diag[dtr], THRESHOLD_DB))}")
+            print(f"    {'':<26} тест : {fmt(metrics(yd[~dtr], pred_diag[~dtr], THRESHOLD_DB))}")
+        level_table(y[~tr], {"прямая": pred_direct[~tr], "Z": pred_z[~tr]}, THRESHOLD_DB,
+                    "Тест по уровню |S_ij| в расчете (прямая связь / полная матрица Z)")
+        S_all = None
     if obs["pool"].nunique() > 1:
-        print(f"  Тест по пулам (порядок {order}):")
+        print(f"  Тест по пулам ({'полная матрица Z' if use_z else f'прямая связь, порядок {order}'}):")
         for pid in sorted(obs["pool"].unique()):
             msk = (~tr) & (obs["pool"].to_numpy() == pid)
-            print(f"    пул {pid + 1}: {fmt(metrics(y[msk], final[msk], THRESHOLD_DB))}")
-    return final, hist[order][2], sgn, k
+            print(f"    пул {pid + 1}: {fmt(metrics(y[msk], pred_final[msk], THRESHOLD_DB))}")
+
+    # 5. Время предсказания на одну конфигурацию решетки (все S_ij антенн конфигурации)
+    n_te = max(len(cfg_te), 1)
+    for name, zz in [("прямая связь", None)] + ([("полная матрица Z", zeta)] if Z_MODEL else []):
+        mod = direct if zz is None else zmodel
+        t_s = time.time()
+        lattice_predict(mod, zz, cfg_te, geometry, n_ant, model_of, models, k, sgn, nbo)
+        batch = (time.time() - t_s) / n_te
+        one = cfg_te.iloc[:1]
+        reps = 5
+        t_s = time.time()
+        for _ in range(reps):
+            lattice_predict(mod, zz, one, geometry, n_ant, model_of, models, k, sgn, nbo)
+        single = (time.time() - t_s) / reps
+        timing[f"predict {name}"] = (batch, single)
+    return {"pred": pred_final, "pred_direct": pred_direct, "pred_diag": pred_diag, "direct": direct,
+            "zmodel": zmodel, "zeta": zeta, "use_z": use_z, "sgn": sgn, "k": k, "timing": timing, "order": order}
 
 
-def save_model(path, model, models, model_of, labels, sgn, k, freq):
+def save_model(path, model, models, model_of, labels, sgn, k, freq, zeta=None):
     np.savez(path, order=model.order, theta_sign=sgn, k_per_mm=k, freq_GHz=freq,
+             model_kind="direct" if zeta is None else "z", zeta=np.array([]) if zeta is None else zeta,
              antenna_labels=np.array(labels), antenna_model=model_of,
              model_names=np.array([m.name for m in models]),
              poles_local_mm=np.array([m.local(sgn) for m in models], dtype=object),
@@ -1677,27 +2108,58 @@ def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     print(f"Чтение данных (freq_idx = {FREQ_IDX}):")
     obs, n_ant, freq = load_pools(files, FREQ_IDX)
-    geometry, labels = obs.attrs["geometry"], obs.attrs["labels"]
+    geometry, labels, diag_all = obs.attrs["geometry"], obs.attrs["labels"], obs.attrs["diag"]
+    obs.attrs = {}
+    t_poles = time.time()
     models, model_of = antenna_models(n_ant, labels, yaml_path)
+    t_poles = time.time() - t_poles
 
-    parts = [("все пулы", obs)] if SHARED_ACROSS_POOLS else \
-        [(f"пул {p + 1}", obs[obs["pool"] == p]) for p in sorted(obs["pool"].unique())]
-    out = []
-    for tag, part in parts:
+    pool_ids = sorted(obs["pool"].unique())
+    parts = [("все пулы", obs, diag_all)] if SHARED_ACROSS_POOLS else \
+        [(f"пул {p + 1}", obs[obs["pool"] == p],
+          None if diag_all is None else diag_all[diag_all["pool"] == p]) for p in pool_ids]
+    out, timings = [], []
+    for tag, part, dpart in parts:
         part = part.reset_index(drop=True)
-        pred, model, sgn, k = run(part, models, model_of, freq, tag, rng)
-        out.append(part.assign(S_pred_dB=pred, split=np.where(part["train"], "train", "test")))
+        if dpart is not None:
+            dpart = dpart.reset_index(drop=True) if len(dpart) else None
+        R = run(part, dpart, models, model_of, freq, tag, rng, geometry, n_ant)
+        timings.append((tag, R["timing"]))
+        pred, sgn, k = R["pred"], R["sgn"], R["k"]
+        rows = part.assign(S_pred_dB=pred, S_pred_direct_dB=R["pred_direct"],
+                           split=np.where(part["train"], "train", "test"))
+        if dpart is not None:
+            d = dpart.assign(ant_j=dpart["ant_i"], S_ij_dB=dpart["S_ii_dB"],
+                             S_pred_dB=np.nan if R["pred_diag"] is None else R["pred_diag"],
+                             S_pred_direct_dB=np.nan, split=np.where(dpart["train"], "train", "test"),
+                             dist_mm=0.0)
+            rows = pd.concat([rows, d], ignore_index=True)
+        out.append(rows)
         suffix = "all" if SHARED_ACROSS_POOLS else f"pool{part['pool'].iloc[0] + 1}"
-        save_model(os.path.join(OUT_DIR, f"model_f{FREQ_IDX}_{suffix}.npz"), model, models, model_of, labels, sgn, k, freq)
+        final_model, final_zeta = (R["zmodel"], R["zeta"]) if R["use_z"] else (R["direct"], None)
+        save_model(os.path.join(OUT_DIR, f"model_f{FREQ_IDX}_{suffix}.npz"), final_model, models, model_of, labels,
+                   sgn, k, freq, final_zeta)
         save_poles_csv(os.path.join(OUT_DIR, f"poles_f{FREQ_IDX}_{suffix}.csv"), models, sgn)
         plots(part, pred, os.path.join(OUT_DIR, f"fit_f{FREQ_IDX}_{suffix}.png"), THRESHOLD_DB)
         diagnostics(part, pred, geometry, k, sgn, os.path.join(OUT_DIR, f"diag_f{FREQ_IDX}_{suffix}"))
     res = pd.concat(out, ignore_index=True)
     res["pool"] = res["pool"] + 1
-    cols = ["pool", "eval_id", "split", "freq_GHz", "ant_i", "ant_j", "S_ij_dB", "S_pred_dB", "dist_mm",
-            "xi", "yi", "thi", "xj", "yj", "thj"]
+    cols = ["pool", "eval_id", "split", "freq_GHz", "ant_i", "ant_j", "S_ij_dB", "S_pred_dB", "S_pred_direct_dB",
+            "dist_mm", "xi", "yi", "thi", "xj", "yj", "thj"]
     path = os.path.join(OUT_DIR, f"predictions_f{FREQ_IDX}.csv")
-    res[cols].to_csv(path, index=False)
+    res.reindex(columns=cols).sort_values(["pool", "eval_id", "ant_i", "ant_j"]).to_csv(path, index=False)
+
+    print("\nВремя:")
+    print(f"  полюсы из VTK: {t_poles:.1f} с" if yaml_path else "  полюсы: центры антенн (без YAML)")
+    for tag, tm in timings:
+        print(f"  {tag}: обучение прямой связи {tm['direct']:.0f} с" +
+              (f", модели через Z {tm['z']:.0f} с" if "z" in tm else "") +
+              f"; всего обучение {tm['train'] + t_poles:.0f} с (с полюсами)")
+        for key, val in tm.items():
+            if key.startswith("predict"):
+                batch, single = val
+                print(f"    предсказание всех S одной конфигурации ({n_ant} антенн), {key[8:]}: "
+                      f"{1e3 * batch:.1f} мс в пакете тестовых конфигураций, {1e3 * single:.1f} мс по одной")
     print(f"\nПредсказания: {path}; всего {time.time() - t0:.0f} с")
 
 
